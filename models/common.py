@@ -32,14 +32,6 @@ class MP(nn.Module):
     def forward(self, x):
         return self.m(x)
 
-class SP(nn.Module):
-    def __init__(self, k=3, s=1):
-        super(SP, self).__init__()
-        self.m = nn.MaxPool2d(kernel_size=k, stride=s, padding=k // 2)
-
-    def forward(self, x):
-        return self.m(x)
-
 class ImplicitA(nn.Module):
     def __init__(self, channel):
         super(ImplicitA, self).__init__()
@@ -69,6 +61,12 @@ class ReOrg(nn.Module):
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
         return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
 
+
+def DWConv(c1, c2, k=1, s=1, act=True):
+    # Depthwise convolution
+    return Conv(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
+
+
 class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
@@ -86,82 +84,6 @@ class Conv(nn.Module):
     def fuseforward(self, x):
         return self.act(self.conv(x))
 
-class RobustConv(nn.Module):
-    # Robust convolution (use high kernel size 7-11 for: downsampling and other layers). Train for 300 - 450 epochs.
-    def __init__(self, c1, c2, k=7, s=1, p=None, g=1, act=True, layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
-        super(RobustConv, self).__init__()
-        self.conv_dw = Conv(c1, c1, k=k, s=s, p=p, g=c1, act=act)
-        self.conv1x1 = nn.Conv2d(c1, c2, 1, 1, 0, groups=1, bias=True)
-        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(c2)) if layer_scale_init_value > 0 else None
-
-    def forward(self, x):
-        x = x.to(memory_format=torch.channels_last)
-        x = self.conv1x1(self.conv_dw(x))
-        if self.gamma is not None:
-            x = x.mul(self.gamma.reshape(1, -1, 1, 1)) 
-        return x
-
-
-class RobustConv2(nn.Module):
-    # Robust convolution 2 (use [32, 5, 2] or [32, 7, 4] or [32, 11, 8] for one of the paths in CSP).
-    def __init__(self, c1, c2, k=7, s=4, p=None, g=1, act=True, layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
-        super(RobustConv2, self).__init__()
-        self.conv_strided = Conv(c1, c1, k=k, s=s, p=p, g=c1, act=act)
-        self.conv_deconv = nn.ConvTranspose2d(in_channels=c1, out_channels=c2, kernel_size=s, stride=s, 
-                                              padding=0, bias=True, dilation=1, groups=1
-        )
-        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(c2)) if layer_scale_init_value > 0 else None
-
-    def forward(self, x):
-        x = self.conv_deconv(self.conv_strided(x))
-        if self.gamma is not None:
-            x = x.mul(self.gamma.reshape(1, -1, 1, 1)) 
-        return x
-
-def DWConv(c1, c2, k=1, s=1, act=True):
-    # Depthwise convolution
-    return Conv(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
-
-class GhostConv(nn.Module):
-    # Ghost Convolution https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):  # ch_in, ch_out, kernel, stride, groups
-        super(GhostConv, self).__init__()
-        c_ = c2 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, k, s, None, g, act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act)
-
-    def forward(self, x):
-        y = self.cv1(x)
-        return torch.cat([y, self.cv2(y)], 1)
-
-
-class Stem(nn.Module):
-    # Stem
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
-        super(Stem, self).__init__()
-        c_ = int(c2/2)  # hidden channels
-        self.cv1 = Conv(c1, c_, 3, 2)
-        self.cv2 = Conv(c_, c_, 1, 1)
-        self.cv3 = Conv(c_, c_, 3, 2)
-        self.pool = torch.nn.MaxPool2d(2, stride=2)
-        self.cv4 = Conv(2 * c_, c2, 1, 1)
-
-    def forward(self, x):
-        x = self.cv1(x)
-        return self.cv4(torch.cat((self.cv3(self.cv2(x)), self.pool(x)), dim=1))
-
-class DownC(nn.Module):
-    # Spatial pyramid pooling layer used in YOLOv3-SPP
-    def __init__(self, c1, c2, n=1, k=2):
-        super(DownC, self).__init__()
-        c_ = int(c1)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2//2, 3, k)
-        self.cv3 = Conv(c1, c2//2, 1, 1)
-        self.mp = nn.MaxPool2d(kernel_size=k, stride=k)
-
-    def forward(self, x):
-        return torch.cat((self.cv2(self.cv1(x)), self.cv3(self.mp(x))), dim=1)
 
 class TransformerLayer(nn.Module):
     # Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)
@@ -278,40 +200,6 @@ class BottleneckCSP2(nn.Module):
         y2 = self.cv2(x1)
         return self.cv3(self.act(self.bn(torch.cat((y1, y2), dim=1))))
 
-class Res(nn.Module):
-    # ResNet bottleneck
-    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
-        super(Res, self).__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c_, 3, 1, g=g)
-        self.cv3 = Conv(c_, c2, 1, 1)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        return x + self.cv3(self.cv2(self.cv1(x))) if self.add else self.cv3(self.cv2(self.cv1(x)))
-
-
-class ResX(Res):
-    # ResNet bottleneck
-    def __init__(self, c1, c2, shortcut=True, g=32, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
-        super().__init__(c1, c2, shortcut, g, e)
-        c_ = int(c2 * e)  # hidden channels
-
-
-class Ghost(nn.Module):
-    # Ghost Bottleneck https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=3, s=1):  # ch_in, ch_out, kernel, stride
-        super(Ghost, self).__init__()
-        c_ = c2 // 2
-        self.conv = nn.Sequential(GhostConv(c1, c_, 1, 1),  # pw
-                                  DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-                                  GhostConv(c_, c2, 1, 1, act=False))  # pw-linear
-        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, act=False),
-                                      Conv(c1, c2, 1, 1, act=False)) if s == 2 else nn.Identity()
-
-    def forward(self, x):
-        return self.conv(x) + self.shortcut(x)
 
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
@@ -404,77 +292,6 @@ class SPPCSPC(nn.Module):
         y2 = self.cv2(x)
         return self.cv7(torch.cat((y1, y2), dim=1))
 
-class GhostSPPCSPC(SPPCSPC):
-    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
-        super().__init__(c1, c2, n, shortcut, g, e, k)
-        c_ = int(2 * c2 * e)  # hidden channels
-        self.cv1 = GhostConv(c1, c_, 1, 1)
-        self.cv2 = GhostConv(c1, c_, 1, 1)
-        self.cv3 = GhostConv(c_, c_, 3, 1)
-        self.cv4 = GhostConv(c_, c_, 1, 1)
-        self.cv5 = GhostConv(4 * c_, c_, 1, 1)
-        self.cv6 = GhostConv(c_, c_, 3, 1)
-        self.cv7 = GhostConv(2 * c_, c2, 1, 1)
-
-class GhostStem(Stem):
-    # Stem
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
-        super().__init__(c1, c2, k, s, p, g, act)
-        c_ = int(c2/2)  # hidden channels
-        self.cv1 = GhostConv(c1, c_, 3, 2)
-        self.cv2 = GhostConv(c_, c_, 1, 1)
-        self.cv3 = GhostConv(c_, c_, 3, 2)
-        self.cv4 = GhostConv(2 * c_, c2, 1, 1)
-
-class BottleneckCSPA(nn.Module):
-    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
-        super(BottleneckCSPA, self).__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
-
-    def forward(self, x):
-        y1 = self.m(self.cv1(x))
-        y2 = self.cv2(x)
-        return self.cv3(torch.cat((y1, y2), dim=1))
-
-
-class BottleneckCSPB(nn.Module):
-    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
-        super(BottleneckCSPB, self).__init__()
-        c_ = int(c2)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
-
-    def forward(self, x):
-        x1 = self.cv1(x)
-        y1 = self.m(x1)
-        y2 = self.cv2(x1)
-        return self.cv3(torch.cat((y1, y2), dim=1))
-
-
-class BottleneckCSPC(nn.Module):
-    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
-        super(BottleneckCSPC, self).__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(c_, c_, 1, 1)
-        self.cv4 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
-
-    def forward(self, x):
-        y1 = self.cv3(self.m(self.cv1(x)))
-        y2 = self.cv2(x)
-        return self.cv4(torch.cat((y1, y2), dim=1))
 
 class Focus(nn.Module):
     # Focus wh information into c-space
@@ -537,6 +354,7 @@ class Expand(nn.Module):
         x = x.permute(0, 3, 4, 1, 5, 2).contiguous()  # x(1,16,80,2,80,2)
         return x.view(N, C // s ** 2, H * s, W * s)  # x(1,16,160,160)
 
+
 class Concat(nn.Module):
     # Concatenate a list of tensors along dimension
     def __init__(self, dimension=1):
@@ -546,37 +364,6 @@ class Concat(nn.Module):
     def forward(self, x):
         return torch.cat(x, self.d)
 
-class Chuncat(nn.Module):
-    def __init__(self, dimension=1):
-        super(Chuncat, self).__init__()
-        self.d = dimension
-
-    def forward(self, x):
-        x1 = []
-        x2 = []
-        for xi in x:
-            xi1, xi2 = xi.chunk(2, self.d)
-            x1.append(xi1)
-            x2.append(xi2)
-        return torch.cat(x1+x2, self.d)
-
-
-class Shortcut(nn.Module):
-    def __init__(self, dimension=0):
-        super(Shortcut, self).__init__()
-        self.d = dimension
-
-    def forward(self, x):
-        return x[0]+x[1]
-
-class Foldcut(nn.Module):
-    def __init__(self, dimension=0):
-        super(Foldcut, self).__init__()
-        self.d = dimension
-
-    def forward(self, x):
-        x1, x2 = x.chunk(2, self.d)
-        return x1+x2
 
 class NMS(nn.Module):
     # Non-Maximum Suppression (NMS) module
